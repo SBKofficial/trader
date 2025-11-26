@@ -5,6 +5,7 @@ from tabulate import tabulate
 import warnings
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
+warnings.simplefilter(action='ignore', category=RuntimeWarning) # Ignore divide by zero warnings
 
 # ==========================================
 #        CONSERVATIVE BACKTEST CONFIG
@@ -31,11 +32,26 @@ def calculate_zerodha_charges(turnover):
 def round_price(num):
     return round(0.05 * round(num/0.05), 2)
 
+def safe_float(val):
+    """Ensures the value is a clean float, not NaN or Inf"""
+    try:
+        val = float(val)
+        if np.isnan(val) or np.isinf(val):
+            return None
+        return val
+    except:
+        return None
+
 def run_conservative_simulation():
     print("⏳ Fetching Data for Conservative Stress Test...")
     tickers = STOCKS + ["^NSEI"]
     df = yf.download(tickers, period="1y", interval="1d", progress=False)
-    if isinstance(df.columns, pd.MultiIndex): df = df.swaplevel(0, 1, axis=1)
+    
+    # Flatten MultiIndex columns
+    if isinstance(df.columns, pd.MultiIndex):
+        try:
+            df = df.swaplevel(0, 1, axis=1)
+        except: pass
 
     capital = START_CAPITAL
     total_invested = START_CAPITAL
@@ -55,8 +71,11 @@ def run_conservative_simulation():
 
         # Nifty Filter
         try:
-            n_open = df["^NSEI"]['Open'].iloc[i]
-            n_prev = df["^NSEI"]['Close'].iloc[i-1]
+            n_open = safe_float(df["^NSEI"]['Open'].iloc[i])
+            n_prev = safe_float(df["^NSEI"]['Close'].iloc[i-1])
+            
+            if n_open is None or n_prev is None: continue
+            
             n_gap = (n_open - n_prev)/n_prev
             allowed = "BUY" if n_gap > 0.001 else ("SELL" if n_gap < -0.001 else "BOTH")
         except: continue
@@ -65,11 +84,19 @@ def run_conservative_simulation():
         candidates = []
         for stock in STOCKS:
             try:
-                p_high, p_low, p_close = df[stock]['High'].iloc[i-1], df[stock]['Low'].iloc[i-1], df[stock]['Close'].iloc[i-1]
-                c_open = df[stock]['Open'].iloc[i]
+                # Use safe_float to prevent NaNs
+                p_high = safe_float(df[stock]['High'].iloc[i-1])
+                p_low = safe_float(df[stock]['Low'].iloc[i-1])
+                p_close = safe_get_value = safe_float(df[stock]['Close'].iloc[i-1])
+                c_open = safe_float(df[stock]['Open'].iloc[i])
+                
+                # Skip if any data is bad
+                if None in [p_high, p_low, p_close, c_open]: continue
                 
                 rng = p_high - p_low
-                if rng == 0: continue
+                
+                # Safety Check: If Range is 0, skip division
+                if rng <= 0: continue
                 
                 buy_trig = round_price(p_high + p_close * BUFFER_PCT)
                 sell_trig = round_price(p_low - p_close * BUFFER_PCT)
@@ -85,79 +112,98 @@ def run_conservative_simulation():
                 if signal == "BUY" and c_open > buy_trig * 1.002: continue
                 if signal == "SELL" and c_open < sell_trig * 0.998: continue
                 
-                score = (p_close-p_low)/rng if signal=="BUY" else (p_high-p_close)/rng
+                # Calculate Score (The Error Fix)
+                if signal == "BUY":
+                    score = (p_close - p_low) / rng
+                else:
+                    score = (p_high - p_close) / rng
                 
+                # Check for infinity score
+                if np.isinf(score) or np.isnan(score): continue
+
                 candidates.append({"stock": stock, "type": signal, "score": score, 
                                    "entry": buy_trig if signal=="BUY" else sell_trig})
             except: continue
 
         if not candidates: continue
+        
+        # Sort candidates by score
         candidates.sort(key=lambda x: x['score'], reverse=True)
         trade = candidates[0] # Top Pick
 
         # EXECUTION (CONSERVATIVE LOGIC)
-        # Check today's High/Low
-        c_high = df[trade['stock']]['High'].iloc[i]
-        c_low = df[trade['stock']]['Low'].iloc[i]
-        entry = trade['entry']
-        
-        # Verify Trigger Happened
-        triggered = False
-        if trade['type'] == "BUY" and c_high >= entry: triggered = True
-        if trade['type'] == "SELL" and c_low <= entry: triggered = True
-        
-        if not triggered: continue
-
-        qty = int((capital * LEVERAGE) / entry)
-        
-        # PESSIMISTIC OUTCOME CHECK
-        # If SL range is touched, we assume LOSS first.
-        outcome = "WIN"
-        exit_price = 0
-        
-        if trade['type'] == "BUY":
-            sl = round_price(entry * (1 - SL_PCT))
-            tgt = round_price(entry * (1 + TARGET_PCT))
+        try:
+            c_high = safe_float(df[trade['stock']]['High'].iloc[i])
+            c_low = safe_float(df[trade['stock']]['Low'].iloc[i])
             
-            if c_low <= sl: # SL touched? Assume Loss.
-                outcome = "LOSS"
-                exit_price = sl
-            elif c_high >= tgt:
-                outcome = "WIN"
-                exit_price = tgt
-            else:
-                outcome = "EOD"
-                exit_price = df[trade['stock']]['Close'].iloc[i]
+            if c_high is None or c_low is None: continue
+            
+            entry = trade['entry']
+            
+            # Verify Trigger Happened
+            triggered = False
+            if trade['type'] == "BUY" and c_high >= entry: triggered = True
+            if trade['type'] == "SELL" and c_low <= entry: triggered = True
+            
+            if not triggered: continue
+
+            qty = int((capital * LEVERAGE) / entry)
+            
+            # PESSIMISTIC OUTCOME CHECK
+            outcome = "WIN"
+            exit_price = 0
+            
+            if trade['type'] == "BUY":
+                sl = round_price(entry * (1 - SL_PCT))
+                tgt = round_price(entry * (1 + TARGET_PCT))
                 
-        else: # SELL
-            sl = round_price(entry * (1 + SL_PCT))
-            tgt = round_price(entry * (1 - TARGET_PCT))
-            
-            if c_high >= sl: # SL touched? Assume Loss.
-                outcome = "LOSS"
-                exit_price = sl
-            elif c_low <= tgt:
-                outcome = "WIN"
-                exit_price = tgt
-            else:
-                outcome = "EOD"
-                exit_price = df[trade['stock']]['Close'].iloc[i]
+                if c_low <= sl: # SL touched? Assume Loss.
+                    outcome = "LOSS"
+                    exit_price = sl
+                elif c_high >= tgt:
+                    outcome = "WIN"
+                    exit_price = tgt
+                else:
+                    outcome = "EOD"
+                    exit_price = safe_float(df[trade['stock']]['Close'].iloc[i])
+                    
+            else: # SELL
+                sl = round_price(entry * (1 + SL_PCT))
+                tgt = round_price(entry * (1 - TARGET_PCT))
+                
+                if c_high >= sl: # SL touched? Assume Loss.
+                    outcome = "LOSS"
+                    exit_price = sl
+                elif c_low <= tgt:
+                    outcome = "WIN"
+                    exit_price = tgt
+                else:
+                    outcome = "EOD"
+                    exit_price = safe_float(df[trade['stock']]['Close'].iloc[i])
 
-        # Calc PnL
-        gross = (exit_price - entry)*qty if trade['type']=="BUY" else (entry - exit_price)*qty
-        charges = calculate_zerodha_charges((entry*qty), (exit_price*qty))
-        net = gross - charges
-        capital += net
-        
-        if outcome == "WIN": stats["Wins"] += 1
-        else: stats["Losses"] += 1
-        
-        trade_log.append([today.date(), trade['stock'], trade['type'], outcome, int(net), int(capital)])
+            # Calc PnL
+            gross = (exit_price - entry)*qty if trade['type']=="BUY" else (entry - exit_price)*qty
+            turnover = (entry * qty) + (exit_price * qty)
+            charges = calculate_zerodha_charges(turnover)
+            net = gross - charges
+            capital += net
+            
+            if outcome == "WIN": stats["Wins"] += 1
+            else: stats["Losses"] += 1
+            
+            trade_log.append([today.date(), trade['stock'], trade['type'], outcome, int(net), int(capital)])
+
+        except: continue
 
     # Print Full Log
-    print(tabulate(trade_log, headers=["Date", "Stock", "Type", "Result", "PnL", "Balance"], tablefmt="simple"))
+    print(tabulate(trade_log[-20:], headers=["Date", "Stock", "Type", "Result", "PnL", "Balance"], tablefmt="simple"))
     print(f"\n🏆 FINAL CONSERVATIVE BALANCE: ₹{int(capital)}")
     print(f"💰 NET PROFIT: ₹{int(capital - total_invested)}")
-    print(f"📊 ROI: {round(((capital-total_invested)/total_invested)*100, 2)}%")
+    try:
+        roi = round(((capital-total_invested)/total_invested)*100, 2)
+        print(f"📊 ROI: {roi}%")
+    except:
+        print("📊 ROI: 0%")
 
-run_conservative_simulation()
+if __name__ == "__main__":
+    run_conservative_simulation()
