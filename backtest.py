@@ -1,209 +1,310 @@
-import yfinance as yf
-import pandas as pd
+#!/usr/bin/env python3
+"""
+Weekly Supertrend regime-based ETF strategy checker.
+
+Behavior:
+ - Computes Supertrend(10, 2.5) on weekly candles for:
+    * NIFTY master ticker (market regime)
+    * Equity ETFs (only trade when NIFTY is green)
+    * Gold & Silver (independent)
+    * LiquidBees (used only when NIFTY is red)
+ - Outputs actionable summary: which ETFs to BUY / SELL / HOLD,
+   and whether to move to LIQUIDBEES (100% equity -> LIQUIDBEES) when NIFTY red.
+
+Configure by environment variables or edit DEFAULT lists below.
+Optionally posts JSON summary to webhook if WEBHOOK_URL env var is set.
+
+Run in CI weekly (GitHub Actions). Keep your tickers correct for your market/data source.
+
+Author: Generated for user
+"""
+import os
+import json
+import sys
+from datetime import datetime, timedelta
+
 import numpy as np
-from tabulate import tabulate
-import warnings
+import pandas as pd
+import yfinance as yf
+import requests
 
-warnings.simplefilter(action='ignore', category=FutureWarning)
-warnings.simplefilter(action='ignore', category=RuntimeWarning) # Ignore divide by zero warnings
+# ---------- CONFIGURATION (override with env vars) ----------
+# Default tickers - replace with exact tickers you use on your data source.
+DEFAULT_NIFTY_TICKER = os.getenv("NIFTY_TICKER", "^NSEI")  # example: '^NSEI' (TradingView/yfinance)
+DEFAULT_EQUITY_ETFS = os.getenv("EQUITY_ETFS", "NIFTYBEES.NS,MOMENTUM.NS,MON100.NS,HDFCSML250.NS,MID150BEES.NS")
+DEFAULT_GOLD_SILVER = os.getenv("GOLD_SILVER", "GOLDBEES.NS,SILVERBEES.NS")
+DEFAULT_LIQUID = os.getenv("LIQUID_TICKER", "LIQUIDBEES.NS")
+DATA_PERIOD = os.getenv("DATA_PERIOD", "5y")  # how far back for weekly data
+SUPER_PERIOD = int(os.getenv("SUPER_PERIOD", "10"))
+SUPER_MULT = float(os.getenv("SUPER_MULT", "2.5"))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # optional, POSTs JSON summary to this URL
+VERBOSE = os.getenv("VERBOSE", "1") == "1"
 
-# ==========================================
-#        CONSERVATIVE BACKTEST CONFIG
-# ==========================================
-START_CAPITAL = 15000
-MONTHLY_SIP = 2000
-LEVERAGE = 5
-BUFFER_PCT = 0.0005
-TARGET_PCT = 0.006
-SL_PCT = 0.002
+# parse lists
+EQUITY_ETFS = [t.strip() for t in DEFAULT_EQUITY_ETFS.split(",") if t.strip()]
+GOLD_SILVER = [t.strip() for t in DEFAULT_GOLD_SILVER.split(",") if t.strip()]
 
-STOCKS = ["TATASTEEL.NS", "ONGC.NS", "POWERGRID.NS", "NTPC.NS", 
-          "BPCL.NS", "COALINDIA.NS", "ITC.NS", "BEL.NS"]
+# ---------- UTILITIES ----------
+def fetch_weekly(ticker: str, period=DATA_PERIOD):
+    """Fetch weekly OHLCV data for ticker using yfinance."""
+    df = yf.download(tickers=ticker, period=period, interval="1wk", progress=False)
+    if df is None or df.empty:
+        raise RuntimeError(f"No data for ticker: {ticker}")
+    # Ensure proper column names
+    df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+    df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+    return df
 
-def calculate_zerodha_charges(turnover):
-    brokerage = min(20, turnover * 0.0003)
-    stt = (turnover / 2) * 0.00025
-    txn_charge = turnover * 0.0000297
-    gst = (brokerage + txn_charge) * 0.18
-    stamp = (turnover / 2) * 0.00003
-    sebi = turnover * 0.000001
-    return round(brokerage + stt + txn_charge + gst + stamp + sebi, 2)
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """True Range / ATR calculation."""
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(period, min_periods=1).mean()
+    return atr
 
-def round_price(num):
-    return round(0.05 * round(num/0.05), 2)
+def supertrend(df: pd.DataFrame, period: int = SUPER_PERIOD, multiplier: float = SUPER_MULT):
+    """
+    Compute Supertrend. Returns df with columns:
+      - 'ST' : True if trend is bullish (green), False if bearish (red)
+      - 'ST_value' : numeric band value
+    Algorithm based on ATR bands (common implementation).
+    """
+    df = df.copy()
+    atr_series = atr(df, period)
+    hl2 = (df["High"] + df["Low"]) / 2.0
+    basic_upperband = hl2 + (multiplier * atr_series)
+    basic_lowerband = hl2 - (multiplier * atr_series)
 
-def safe_float(val):
-    """Ensures the value is a clean float, not NaN or Inf"""
+    final_upperband = pd.Series(index=df.index, dtype=float)
+    final_lowerband = pd.Series(index=df.index, dtype=float)
+    st = pd.Series(index=df.index, dtype=bool)
+    st_value = pd.Series(index=df.index, dtype=float)
+
+    for i in range(len(df)):
+        if i == 0:
+            final_upperband.iloc[i] = basic_upperband.iloc[i]
+            final_lowerband.iloc[i] = basic_lowerband.iloc[i]
+            st.iloc[i] = True  # start with bullish by default
+            st_value.iloc[i] = final_lowerband.iloc[i]  # just pick one
+            continue
+
+        # final upper band
+        if (basic_upperband.iloc[i] < final_upperband.iloc[i-1]) or (df["Close"].iloc[i-1] > final_upperband.iloc[i-1]):
+            final_upperband.iloc[i] = basic_upperband.iloc[i]
+        else:
+            final_upperband.iloc[i] = final_upperband.iloc[i-1]
+
+        # final lower band
+        if (basic_lowerband.iloc[i] > final_lowerband.iloc[i-1]) or (df["Close"].iloc[i-1] < final_lowerband.iloc[i-1]):
+            final_lowerband.iloc[i] = basic_lowerband.iloc[i]
+        else:
+            final_lowerband.iloc[i] = final_lowerband.iloc[i-1]
+
+        # determine trend
+        if st.iloc[i-1] and df["Close"].iloc[i] <= final_upperband.iloc[i]:
+            st.iloc[i] = False
+        elif (not st.iloc[i-1]) and df["Close"].iloc[i] >= final_lowerband.iloc[i]:
+            st.iloc[i] = True
+        else:
+            st.iloc[i] = st.iloc[i-1]
+
+        st_value.iloc[i] = final_lowerband.iloc[i] if st.iloc[i] else final_upperband.iloc[i]
+
+    df["ST_bool"] = st
+    df["ST_value"] = st_value
+    df["ATR"] = atr_series
+    return df
+
+# ---------- STRATEGY LOGIC ----------
+def analyze_all(nifty_ticker, equity_tickers, gold_silver_tickers, liquid_ticker):
+    """Main analysis flow returning actionable plan."""
+    report = {
+        "timestamp_utc": datetime.utcnow().isoformat(),
+        "nifty_ticker": nifty_ticker,
+        "equity_tickers": equity_tickers,
+        "gold_silver_tickers": gold_silver_tickers,
+        "liquid_ticker": liquid_ticker,
+        "nifty": {},
+        "etfs": {},
+        "gold_silver": {},
+        "action_summary": []
+    }
+
+    # 1) NIFTY weekly ST
     try:
-        val = float(val)
-        if np.isnan(val) or np.isinf(val):
-            return None
-        return val
-    except:
-        return None
+        df_nifty = fetch_weekly(nifty_ticker)
+    except Exception as e:
+        raise RuntimeError(f"Failed to fetch NIFTY data: {e}")
 
-def run_conservative_simulation():
-    print("⏳ Fetching Data for Conservative Stress Test...")
-    tickers = STOCKS + ["^NSEI"]
-    df = yf.download(tickers, period="1y", interval="1d", progress=False)
-    
-    # Flatten MultiIndex columns
-    if isinstance(df.columns, pd.MultiIndex):
+    st_nifty = supertrend(df_nifty, period=SUPER_PERIOD, multiplier=SUPER_MULT)
+    # take latest week (most recent bar)
+    latest_n = st_nifty.iloc[-1]
+    nifty_is_green = bool(latest_n["ST_bool"])
+    report["nifty"]["last_close"] = float(latest_n["Close"])
+    report["nifty"]["st_is_green"] = nifty_is_green
+    report["nifty"]["st_value"] = float(latest_n["ST_value"])
+
+    # Decision: if NIFTY red -> move equities to LiquidBees only
+    if not nifty_is_green:
+        report["action_summary"].append({
+            "action": "MARKET_RED",
+            "note": "NIFTY Weekly Supertrend is RED. Move equity allocations to LIQUIDBEES only (per your rule)."
+        })
+
+    # 2) Equity ETFs: only meaningful if NIFTY is green; but we still compute ST for info
+    for t in equity_tickers:
         try:
-            df = df.swaplevel(0, 1, axis=1)
-        except: pass
+            df = fetch_weekly(t)
+            st = supertrend(df, period=SUPER_PERIOD, multiplier=SUPER_MULT)
+            last = st.iloc[-1]
+            prev = st.iloc[-2] if len(st) >= 2 else last
+            is_green = bool(last["ST_bool"])
+            was_green = bool(prev["ST_bool"])
+            report["etfs"][t] = {
+                "last_close": float(last["Close"]),
+                "st_is_green": is_green,
+                "st_prev_green": was_green,
+                "st_value": float(last["ST_value"])
+            }
 
-    capital = START_CAPITAL
-    total_invested = START_CAPITAL
-    trade_log = []
-    stats = {"Wins": 0, "Losses": 0}
+            # Actions
+            if not nifty_is_green:
+                # Nifty red: rule says exit equities
+                report["action_summary"].append({
+                    "ticker": t,
+                    "action": "SELL",
+                    "reason": "NIFTY weekly Supertrend is RED - per master rule exit equity ETFs and park in LIQUIDBEES."
+                })
+            else:
+                # Nifty green: follow ETF's own weekly ST
+                if is_green and not was_green:
+                    report["action_summary"].append({
+                        "ticker": t,
+                        "action": "BUY",
+                        "reason": "ETF weekly Supertrend turned GREEN and NIFTY is GREEN."
+                    })
+                elif not is_green and was_green:
+                    report["action_summary"].append({
+                        "ticker": t,
+                        "action": "SELL",
+                        "reason": "ETF weekly Supertrend turned RED while NIFTY is GREEN."
+                    })
+                else:
+                    report["action_summary"].append({
+                        "ticker": t,
+                        "action": "HOLD",
+                        "reason": "No change in ETF weekly Supertrend."
+                    })
+        except Exception as e:
+            report["etfs"][t] = {"error": str(e)}
+            report["action_summary"].append({
+                "ticker": t,
+                "action": "ERROR",
+                "reason": str(e)
+            })
 
-    dates = df.index
-    
-    for i in range(1, len(dates)):
-        today = dates[i]
-        prev_date = dates[i-1]
-        
-        # SIP
-        if today.month != prev_date.month:
-            capital += MONTHLY_SIP
-            total_invested += MONTHLY_SIP
-
-        # Nifty Filter
+    # 3) Gold & Silver - independent of NIFTY
+    for t in gold_silver_tickers:
         try:
-            n_open = safe_float(df["^NSEI"]['Open'].iloc[i])
-            n_prev = safe_float(df["^NSEI"]['Close'].iloc[i-1])
-            
-            if n_open is None or n_prev is None: continue
-            
-            n_gap = (n_open - n_prev)/n_prev
-            allowed = "BUY" if n_gap > 0.001 else ("SELL" if n_gap < -0.001 else "BOTH")
-        except: continue
+            df = fetch_weekly(t)
+            st = supertrend(df, period=SUPER_PERIOD, multiplier=SUPER_MULT)
+            last = st.iloc[-1]
+            prev = st.iloc[-2] if len(st) >= 2 else last
+            is_green = bool(last["ST_bool"])
+            was_green = bool(prev["ST_bool"])
+            report["gold_silver"][t] = {
+                "last_close": float(last["Close"]),
+                "st_is_green": is_green,
+                "st_prev_green": was_green,
+                "st_value": float(last["ST_value"])
+            }
+            if is_green and not was_green:
+                report["action_summary"].append({
+                    "ticker": t,
+                    "action": "BUY",
+                    "reason": "Gold/Silver weekly Supertrend turned GREEN (independent of NIFTY)."
+                })
+            elif not is_green and was_green:
+                report["action_summary"].append({
+                    "ticker": t,
+                    "action": "SELL",
+                    "reason": "Gold/Silver weekly Supertrend turned RED (independent of NIFTY)."
+                })
+            else:
+                report["action_summary"].append({
+                    "ticker": t,
+                    "action": "HOLD",
+                    "reason": "No change in weekly Supertrend for Gold/Silver."
+                })
+        except Exception as e:
+            report["gold_silver"][t] = {"error": str(e)}
+            report["action_summary"].append({
+                "ticker": t,
+                "action": "ERROR",
+                "reason": str(e)
+            })
 
-        # Select Best Stock
-        candidates = []
-        for stock in STOCKS:
-            try:
-                # Use safe_float to prevent NaNs
-                p_high = safe_float(df[stock]['High'].iloc[i-1])
-                p_low = safe_float(df[stock]['Low'].iloc[i-1])
-                p_close = safe_get_value = safe_float(df[stock]['Close'].iloc[i-1])
-                c_open = safe_float(df[stock]['Open'].iloc[i])
-                
-                # Skip if any data is bad
-                if None in [p_high, p_low, p_close, c_open]: continue
-                
-                rng = p_high - p_low
-                
-                # Safety Check: If Range is 0, skip division
-                if rng <= 0: continue
-                
-                buy_trig = round_price(p_high + p_close * BUFFER_PCT)
-                sell_trig = round_price(p_low - p_close * BUFFER_PCT)
-                
-                signal = None
-                if p_close >= (p_high - rng*0.25): signal = "BUY"
-                elif p_close <= (p_low + rng*0.25): signal = "SELL"
-                
-                if allowed == "BUY" and signal == "SELL": continue
-                if allowed == "SELL" and signal == "BUY": continue
-                
-                # Gap Filter
-                if signal == "BUY" and c_open > buy_trig * 1.002: continue
-                if signal == "SELL" and c_open < sell_trig * 0.998: continue
-                
-                # Calculate Score (The Error Fix)
-                if signal == "BUY":
-                    score = (p_close - p_low) / rng
-                else:
-                    score = (p_high - p_close) / rng
-                
-                # Check for infinity score
-                if np.isinf(score) or np.isnan(score): continue
+    # 4) LiquidBees handling note
+    report["liquidbees"] = {"ticker": liquid_ticker}
+    if not nifty_is_green:
+        report["action_summary"].append({
+            "ticker": liquid_ticker,
+            "action": "PARK",
+            "reason": "NIFTY red -> move equity allocations to LiquidBees per system rule."
+        })
+    else:
+        report["action_summary"].append({
+            "ticker": liquid_ticker,
+            "action": "STANDBY",
+            "reason": "NIFTY green -> LiquidBees used only for leftover cash, not main allocation."
+        })
 
-                candidates.append({"stock": stock, "type": signal, "score": score, 
-                                   "entry": buy_trig if signal=="BUY" else sell_trig})
-            except: continue
+    return report
 
-        if not candidates: continue
-        
-        # Sort candidates by score
-        candidates.sort(key=lambda x: x['score'], reverse=True)
-        trade = candidates[0] # Top Pick
-
-        # EXECUTION (CONSERVATIVE LOGIC)
-        try:
-            c_high = safe_float(df[trade['stock']]['High'].iloc[i])
-            c_low = safe_float(df[trade['stock']]['Low'].iloc[i])
-            
-            if c_high is None or c_low is None: continue
-            
-            entry = trade['entry']
-            
-            # Verify Trigger Happened
-            triggered = False
-            if trade['type'] == "BUY" and c_high >= entry: triggered = True
-            if trade['type'] == "SELL" and c_low <= entry: triggered = True
-            
-            if not triggered: continue
-
-            qty = int((capital * LEVERAGE) / entry)
-            
-            # PESSIMISTIC OUTCOME CHECK
-            outcome = "WIN"
-            exit_price = 0
-            
-            if trade['type'] == "BUY":
-                sl = round_price(entry * (1 - SL_PCT))
-                tgt = round_price(entry * (1 + TARGET_PCT))
-                
-                if c_low <= sl: # SL touched? Assume Loss.
-                    outcome = "LOSS"
-                    exit_price = sl
-                elif c_high >= tgt:
-                    outcome = "WIN"
-                    exit_price = tgt
-                else:
-                    outcome = "EOD"
-                    exit_price = safe_float(df[trade['stock']]['Close'].iloc[i])
-                    
-            else: # SELL
-                sl = round_price(entry * (1 + SL_PCT))
-                tgt = round_price(entry * (1 - TARGET_PCT))
-                
-                if c_high >= sl: # SL touched? Assume Loss.
-                    outcome = "LOSS"
-                    exit_price = sl
-                elif c_low <= tgt:
-                    outcome = "WIN"
-                    exit_price = tgt
-                else:
-                    outcome = "EOD"
-                    exit_price = safe_float(df[trade['stock']]['Close'].iloc[i])
-
-            # Calc PnL
-            gross = (exit_price - entry)*qty if trade['type']=="BUY" else (entry - exit_price)*qty
-            turnover = (entry * qty) + (exit_price * qty)
-            charges = calculate_zerodha_charges(turnover)
-            net = gross - charges
-            capital += net
-            
-            if outcome == "WIN": stats["Wins"] += 1
-            else: stats["Losses"] += 1
-            
-            trade_log.append([today.date(), trade['stock'], trade['type'], outcome, int(net), int(capital)])
-
-        except: continue
-
-    # Print Full Log
-    print(tabulate(trade_log[-20:], headers=["Date", "Stock", "Type", "Result", "PnL", "Balance"], tablefmt="simple"))
-    print(f"\n🏆 FINAL CONSERVATIVE BALANCE: ₹{int(capital)}")
-    print(f"💰 NET PROFIT: ₹{int(capital - total_invested)}")
+def post_webhook(url: str, payload: dict):
     try:
-        roi = round(((capital-total_invested)/total_invested)*100, 2)
-        print(f"📊 ROI: {roi}%")
-    except:
-        print("📊 ROI: 0%")
+        headers = {"Content-Type": "application/json"}
+        resp = requests.post(url, json=payload, headers=headers, timeout=10)
+        return {"status_code": resp.status_code, "text": resp.text}
+    except Exception as e:
+        return {"error": str(e)}
+
+# ---------- MAIN ----------
+def main():
+    nifty = os.getenv("NIFTY_TICKER", DEFAULT_NIFTY_TICKER)
+    equity_list = os.getenv("EQUITY_ETFS", DEFAULT_EQUITY_ETFS).split(",")
+    equity_list = [s.strip() for s in equity_list if s.strip()]
+    gold_silver_list = os.getenv("GOLD_SILVER", DEFAULT_GOLD_SILVER).split(",")
+    gold_silver_list = [s.strip() for s in gold_silver_list if s.strip()]
+    liquid = os.getenv("LIQUID_TICKER", DEFAULT_LIQUID)
+
+    # Analyze
+    try:
+        summary = analyze_all(nifty, equity_list, gold_silver_list, liquid)
+    except Exception as e:
+        print(f"ERROR during analysis: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    # Print pretty summary
+    print(json.dumps(summary, indent=2, default=str))
+
+    # Optional: post to webhook
+    if WEBHOOK_URL:
+        result = post_webhook(WEBHOOK_URL, summary)
+        print("Webhook result:", result)
+
+    # Persist output to file (artifact)
+    out_path = os.getenv("OUTPUT_PATH", "strategy_summary.json")
+    with open(out_path, "w") as f:
+        json.dump(summary, f, indent=2, default=str)
+    if VERBOSE:
+        print(f"Saved summary to {out_path}")
 
 if __name__ == "__main__":
-    run_conservative_simulation()
+    main()
