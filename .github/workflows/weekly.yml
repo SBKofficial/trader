@@ -24,12 +24,11 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run strategy
-        env:
-          NIFTY_TICKER: ${{ secrets.NIFTY_TICKER }}        # optional secret override
-          EQUITY_ETFS: ${{ secrets.EQUITY_ETFS }}          # comma-separated tickers
-          GOLD_SILVER: ${{ secrets.GOLD_SILVER }}
-          LIQUID_TICKER: ${{ secrets.LIQUID_TICKER }}
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}          # optional: post results
+
+          NIFTY_TICKER = [NSEI]
+          EQUITY_ETFS = [NIFTYBEES.NS, MON100.NS, MID150BEES.NS, HDFCSML250.NS, MOMOMENTUM.NS]
+          GOLD_SILVER = [GOLDBEES.NS, SILVERBEES.NS]
+          LIQUID_TICKER = [LIQUIDBEES.NS]
         run: |
           python backtest.py
       - name: Upload result as artifact
