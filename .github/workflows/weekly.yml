@@ -1,0 +1,39 @@
+name: weekly-etf-supertrend-check
+
+on:
+  schedule:
+    # Runs once per week. Edit cron to your preferred time (UTC).
+    - cron: '0 0 * * SUN'   # every Sunday 00:00 UTC; change as needed
+  workflow_dispatch: # allows manual trigger
+
+jobs:
+  run-strategy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run strategy
+        env:
+          NIFTY_TICKER: ${{ secrets.NIFTY_TICKER }}        # optional secret override
+          EQUITY_ETFS: ${{ secrets.EQUITY_ETFS }}          # comma-separated tickers
+          GOLD_SILVER: ${{ secrets.GOLD_SILVER }}
+          LIQUID_TICKER: ${{ secrets.LIQUID_TICKER }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}          # optional: post results
+        run: |
+          python backtest.py
+      - name: Upload result as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: strategy_summary
+          path: strategy_summary.json
